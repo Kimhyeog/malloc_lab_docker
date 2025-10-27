@@ -28,6 +28,7 @@
  * 2. coalesce를 호출해 인접 블록과 병합 (이때 인접 블록은 리스트에서 제거됨)
  * 3. 병합된 최종 블록을 알맞은 크기 클래스 리스트에 삽입
  */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <assert.h>
@@ -79,7 +80,8 @@ team_t team = {
 
 #define NUM_CLASSES 10
 /* --- NEW --- */
-
+/* --- 추가 매크로 --- */
+#define MIN_BLOCK_SIZE (3 * DSIZE) // 최소 블록 크기 (24바이트) 명시
 ////////////////////////////////////////////////////////////////////////////////////////////////////////
 /* --- 전역 변수 --- */
 static char *heap_listp = 0;
@@ -310,37 +312,52 @@ void *mm_malloc(size_t size)
 
 /*
  * find_fit - Segregated list에서 (Best-Fit)으로 블록 검색
+ * (기존 로직 유지 - 주석으로 최적화 가능성 명시)
  */
 static void *find_fit(size_t asize)
 {
     void *bp;
     void *best_bp = NULL;
-    size_t min_diff = (size_t)-1;
+    size_t min_diff = (size_t)-1; // size_t의 최대값으로 초기화
 
     int list_index = get_class_index(asize);
 
-    // 적합한 크기 클래스부터 끝까지 탐색
+    // 적합한 크기 클래스부터 마지막 클래스까지 탐색
     for (int i = list_index; i < NUM_CLASSES; i++)
     {
         bp = seg_list_roots[i];
+        // 현재 클래스 리스트 내 모든 블록 순회
         while (bp != NULL)
         {
             size_t current_size = GET_SIZE(HDRP(bp));
+            // 요청 크기(asize)보다 크거나 같은 블록을 찾으면
             if (current_size >= asize)
             {
-                // 맞는 블록 찾음
                 size_t diff = current_size - asize;
+                // 기존 best_bp보다 더 작은 차이(더 좋은 fit)를 가지면 업데이트
                 if (diff < min_diff)
-                { // 더 좋은 fit 발견
+                {
                     min_diff = diff;
                     best_bp = bp;
+                    // 최적화: 만약 diff가 0이면 완벽한 fit이므로 더 이상 찾을 필요 없음
+                    if (diff == 0)
+                    {
+                        return best_bp; // 즉시 반환 (처리율 향상)
+                    }
                 }
             }
-            bp = GET_NEXT_FREE(bp); // 다음 빈 블록으로 이동
+            bp = GET_NEXT_FREE(bp); // 리스트의 다음 노드로 이동
         }
-        // 현재 리스트에서 best_bp를 찾았으면 더 큰 리스트는 볼 필요 없음 (Best-fit 최적화)
-        // -> 아니지, 더 큰 리스트에 더 딱 맞는게 있을 수도 있다. Best-fit은 끝까지 봐야 함.
+        /*
+         * 처리율 향상을 위한 추가적인 최적화 고려 지점:
+         * 1. 현재 리스트(i)에서 best_bp를 찾았다고 해서 탐색을 중단하면
+         * True Best-Fit이 아니게 되어 이용률이 저하될 수 있음.
+         * (더 큰 다음 리스트(i+1)에 더 딱 맞는 블록이 있을 수 있음)
+         * 2. 각 리스트에서 처음 N개의 블록만 검사하는 방식으로 속도 개선 가능 (이용률 저하 감수)
+         */
     }
+
+    // 모든 리스트 탐색 후 찾은 best_bp 반환 (못 찾았으면 NULL)
     return best_bp;
 }
 
@@ -405,106 +422,155 @@ void mm_free(void *bp)
 /*
  * mm_realloc - realloc 구현
  */
+/* mm_realloc 함수만 표시 */
 void *mm_realloc(void *ptr, size_t size)
 {
     void *oldptr = ptr;
     void *newptr;
     size_t old_size;
-    size_t new_asize; // size에 헤더/푸터/정렬 적용한 크기
+    size_t new_asize;
+    size_t copySize;
+    size_t remainder_size;
 
-    // size == 0 이면 free와 동일
+    // --- 기본 예외 처리 ---
     if (size == 0)
     {
         mm_free(oldptr);
         return NULL;
     }
-
-    // ptr == NULL 이면 malloc과 동일
     if (oldptr == NULL)
     {
         return mm_malloc(size);
     }
 
-    // 새 블록에 필요한 실제 크기 계산 (최소 24바이트)
+    // --- 새 블록 크기 계산 ---
     if (size <= (2 * DSIZE))
     {
-        new_asize = 3 * DSIZE;
+        new_asize = MIN_BLOCK_SIZE;
     }
     else
     {
-        new_asize = DSIZE * ((size + (DSIZE) + (DSIZE - 1)) / DSIZE);
+        new_asize = ALIGN(size + DSIZE);
     }
 
-    old_size = GET_SIZE(HDRP(oldptr)); // 기존 블록의 전체 크기
+    old_size = GET_SIZE(HDRP(oldptr));
 
-    // Case 1: 새 크기가 기존 크기보다 작거나 같은 경우
+    // --- Case 1: Shrinking or Same ---
     if (new_asize <= old_size)
     {
-        // 기존 블록을 그대로 사용하고, 필요하면 분할
-        // (분할 최적화는 복잡하므로 여기서는 단순 반환)
-        // place(oldptr, new_asize); // place는 free 블록에만 사용 가능
-        // 만약 남는 공간이 충분하면 분할해서 free 시킬 수 있음
-        size_t remainder_size = old_size - new_asize;
-        if (remainder_size >= (3 * DSIZE))
+        remainder_size = old_size - new_asize;
+        if (remainder_size >= MIN_BLOCK_SIZE)
         {
-            // 분할: 앞부분은 new_asize 크기로 유지
             PUT(HDRP(oldptr), PACK(new_asize, 1));
             PUT(FTRP(oldptr), PACK(new_asize, 1));
-            // 뒷부분은 free
             void *remainder_bp = NEXT_BLKP(oldptr);
             PUT(HDRP(remainder_bp), PACK(remainder_size, 0));
             PUT(FTRP(remainder_bp), PACK(remainder_size, 0));
-            // free와 동일하게 처리 (coalesce 후 insert)
-            remainder_bp = coalesce(remainder_bp);
-            insert_into_list(remainder_bp);
+            insert_into_list(coalesce(remainder_bp));
         }
-        // 분할하지 못하면 그냥 기존 블록 반환 (내부 단편화 증가)
         return oldptr;
     }
-    // Case 2: 새 크기가 기존 크기보다 큰 경우
+
+    // --- Case 2: Growing ---
     else
     {
-        // 추가 최적화: 다음 블록이 free이고 합친 크기가 충분한가?
+        void *prev_bp = PREV_BLKP(oldptr);
         void *next_bp = NEXT_BLKP(oldptr);
+        size_t prev_alloc = GET_ALLOC(FTRP(prev_bp));
         size_t next_alloc = GET_ALLOC(HDRP(next_bp));
+        size_t prev_size = GET_SIZE(FTRP(prev_bp));
         size_t next_size = GET_SIZE(HDRP(next_bp));
-        size_t combined_size = old_size + next_size;
+        size_t combined_size;
 
-        if (!next_alloc && combined_size >= new_asize)
-        {
-            // 다음 블록과 병합하여 확장
-            remove_from_list(next_bp);                 // 다음 블록을 리스트에서 제거
-            PUT(HDRP(oldptr), PACK(combined_size, 1)); // 현재 블록 헤더 업데이트
-            PUT(FTRP(oldptr), PACK(combined_size, 1)); // 현재 블록 푸터 업데이트 (새 FTRP 위치 계산 필요!)
-                                                       // FTRP 매크로는 HDRP를 참조하므로 헤더 업데이트 후 FTRP 호출하면 OK.
-                                                       // 필요하면 여기서도 분할 가능
-            size_t remainder_size = combined_size - new_asize;
-            if (remainder_size >= (3 * DSIZE))
+        // [!!! NEW OPTIMIZATION !!!] Subcase 2_heap_end: 현재 블록이 힙의 마지막인가?
+        if (next_size == 0)
+        { // 다음 블록이 에필로그 헤더인가?
+            size_t extend_size = new_asize - old_size;
+            // 필요한 만큼만 힙 확장 시도
+            if (mem_sbrk(extend_size) != (void *)-1)
             {
-                // 분할: 앞부분은 new_asize 크기로 유지
+                PUT(HDRP(oldptr), PACK(new_asize, 1));    // 헤더 크기 업데이트
+                PUT(FTRP(oldptr), PACK(new_asize, 1));    // 푸터 크기 업데이트 (위치도 바뀜)
+                PUT(HDRP(NEXT_BLKP(oldptr)), PACK(0, 1)); // 새 에필로그 헤더 설정
+                return oldptr;                            // 기존 포인터 반환
+            }
+            // 힙 확장 실패 시, 아래 일반 로직으로 fallback
+        }
+
+        // Subcase 2a: 다음 블록만 free이고 합치면 충분
+        if (!next_alloc && (combined_size = old_size + next_size) >= new_asize)
+        {
+            remove_from_list(next_bp);
+            PUT(HDRP(oldptr), PACK(combined_size, 1));
+            PUT(FTRP(oldptr), PACK(combined_size, 1));
+            remainder_size = combined_size - new_asize;
+            if (remainder_size >= MIN_BLOCK_SIZE)
+            {
                 PUT(HDRP(oldptr), PACK(new_asize, 1));
                 PUT(FTRP(oldptr), PACK(new_asize, 1));
-                // 뒷부분은 free
                 void *remainder_bp = NEXT_BLKP(oldptr);
                 PUT(HDRP(remainder_bp), PACK(remainder_size, 0));
                 PUT(FTRP(remainder_bp), PACK(remainder_size, 0));
-                remainder_bp = coalesce(remainder_bp); // 혹시 그 다음 블록도 free일 수 있으니 coalesce
-                insert_into_list(remainder_bp);
+                insert_into_list(coalesce(remainder_bp));
             }
             return oldptr;
         }
 
-        // 최적화 실패 -> 새로 malloc 받고 데이터 복사
-        newptr = mm_malloc(size); // size로 요청해야 함 (asize 아님)
-        if (newptr == NULL)
-            return NULL;
+        // Subcase 2b: 이전 블록만 free이고 합치면 충분
+        else if (!prev_alloc && (combined_size = old_size + prev_size) >= new_asize)
+        {
+            remove_from_list(prev_bp);
+            PUT(HDRP(prev_bp), PACK(combined_size, 1));
+            PUT(FTRP(oldptr), PACK(combined_size, 1));
+            copySize = old_size - DSIZE;
+            memmove(prev_bp, oldptr, copySize);
+            remainder_size = combined_size - new_asize;
+            if (remainder_size >= MIN_BLOCK_SIZE)
+            {
+                PUT(HDRP(prev_bp), PACK(new_asize, 1));
+                PUT(FTRP(prev_bp), PACK(new_asize, 1));
+                void *remainder_bp = NEXT_BLKP(prev_bp);
+                PUT(HDRP(remainder_bp), PACK(remainder_size, 0));
+                PUT(FTRP(remainder_bp), PACK(remainder_size, 0));
+                insert_into_list(coalesce(remainder_bp));
+            }
+            return prev_bp;
+        }
 
-        size_t copySize = old_size - DSIZE; // 기존 페이로드 크기
-        if (size < copySize)
-            copySize = size; // 복사할 크기는 둘 중 작은 값
+        // Subcase 2c: 양쪽 블록 모두 free이고 합치면 충분
+        else if (!prev_alloc && !next_alloc && (combined_size = old_size + prev_size + next_size) >= new_asize)
+        {
+            remove_from_list(prev_bp);
+            remove_from_list(next_bp);
+            PUT(HDRP(prev_bp), PACK(combined_size, 1));
+            PUT(FTRP(next_bp), PACK(combined_size, 1));
+            copySize = old_size - DSIZE;
+            memmove(prev_bp, oldptr, copySize);
+            remainder_size = combined_size - new_asize;
+            if (remainder_size >= MIN_BLOCK_SIZE)
+            {
+                PUT(HDRP(prev_bp), PACK(new_asize, 1));
+                PUT(FTRP(prev_bp), PACK(new_asize, 1));
+                void *remainder_bp = NEXT_BLKP(prev_bp);
+                PUT(HDRP(remainder_bp), PACK(remainder_size, 0));
+                PUT(FTRP(remainder_bp), PACK(remainder_size, 0));
+                insert_into_list(coalesce(remainder_bp));
+            }
+            return prev_bp;
+        }
 
-        memcpy(newptr, oldptr, copySize);
-        mm_free(oldptr); // 기존 블록 해제
-        return newptr;
+        // --- Subcase 2d: 최적화 실패 -> 새로 할당하고 복사 ---
+        else
+        {
+            newptr = mm_malloc(size);
+            if (newptr == NULL)
+                return NULL;
+            copySize = GET_SIZE(HDRP(oldptr)) - DSIZE;
+            if (size < copySize)
+                copySize = size;
+            memcpy(newptr, oldptr, copySize);
+            mm_free(oldptr);
+            return newptr;
+        }
     }
 }
