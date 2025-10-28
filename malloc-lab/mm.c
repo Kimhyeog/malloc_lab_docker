@@ -155,6 +155,7 @@ static void remove_from_list(void *bp);
 ////////////////////////////////////////////////////////////////////////////////////////////////////////
 /*
  * get_class_index - 주어진 size가 속해야 할 리스트의 인덱스(0~9)를 반환
+ * Segregated free list(분리된 빈 블록 리스트)를 사용시,내  빈 블록들을 크기별로 여러 리스트에 나눠 관리
  */
 static int get_class_index(size_t size)
 {
@@ -456,9 +457,7 @@ static void *find_fit(size_t asize)
 
                     /* 6. [최적화] 만약 차이가 0이면 (완벽한 fit), 더 찾을 필요 없음 */
                     if (diff == 0)
-                    {
                         return best_bp; /* 즉시 반환 (처리율 향상) */
-                    }
                 }
             }
             bp = GET_NEXT_FREE(bp); /* 리스트의 다음 빈 블록으로 이동 */
@@ -514,9 +513,7 @@ void mm_free(void *bp)
 {
     /* 1. bp가 NULL이거나, 이미 free된 블록(할당 비트 0)이면 오류이므로 즉시 반환 */
     if (bp == NULL || GET_ALLOC(HDRP(bp)) == 0)
-    {
         return;
-    }
 
     /* 2. 현재 블록 크기 가져오기 */
     size_t size = GET_SIZE(HDRP(bp));
